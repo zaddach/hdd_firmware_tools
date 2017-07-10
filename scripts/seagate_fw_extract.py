@@ -33,6 +33,7 @@ from datetime import datetime
 import hdd_crc
 import argparse
 import os
+import pywriteelf
 
 SIZES = {"L": 4, "H": 2}
 
@@ -109,6 +110,7 @@ ARTIFACT_OVERLAY = 0x4a
 ARTIFACT_FLASH_LOADER = 0x457
 ARTIFACT_BOOT_FW = 0x422
 ARTIFACT_MAIN_FW = 0x426
+ARTIFACT_MAYBE_ALSO_MAIN_FW = 0x442
 ARTIFACT_MAYBE_BSS = 0x24
 ARTIFACT_PADDING = 0x7
 ARTIFACT_8051_FW = 0X9603
@@ -127,7 +129,7 @@ ARTIFACT_NAMES = {ARTIFACT_OVERLAY: "Overlay",
                0x4b: "?",
                0xd: "?",
                0x43: "?",
-               0x442: "?"}
+               ARTIFACT_MAYBE_ALSO_MAIN_FW: "MaybeMainFW"}
                            
 def parse_struct(struct_definition, data, offset = 0):
     """Parse a structure according to its definition.
@@ -210,6 +212,14 @@ def parse_chunk_content(chunk):
             sections_header["file_offset"] = chunk["file_offset"] + segment_header_size+sections_header_size
             chunk["sections_header"] = sections_header
             chunk["sections"] = parse_sections(chunk["content_raw"], segment_header_size + sections_header_size, chunk["file_offset"])
+    elif chunk["header"]["type"] in [ARTIFACT_MAYBE_ALSO_MAIN_FW]:
+        segment_header_size = sizeof(SEGMENT_HEADER_DEFINITION)
+        sections_header_size = sizeof(SECTIONS_HEADER_DEFINITION)
+        segment_header = parse_struct(SEGMENT_HEADER_DEFINITION, chunk["content_raw"][:segment_header_size])
+        segment_header["file_offset"] = chunk["file_offset"] + segment_header_size
+        chunk["segment_header"] = segment_header
+        chunk["sections_header"] = {"file_offset": 0, "magic": 0, "field_14": 0,"checksum":0, "field_18": 0, "field_1C": 0}
+        chunk["sections"] = parse_sections(chunk["content_raw"], segment_header_size, chunk["file_offset"])
     elif chunk["header"]["type"] == ARTIFACT_OVERLAY:
         data = parse_overlay(chunk)
         data["file_offset"] = chunk["file_offset"] + sizeof(OVERLAY_HEADER_DEFINITION)
@@ -287,6 +297,7 @@ def print_sections(chunk_lists):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description = "Dump contents of Seagate firmware (.lod) files")
     parser.add_argument("--dump-sections", dest = "dump_sections", action = "store_true", default = False, help = "Dump content of each section to a binary file")
+    parser.add_argument("--dump-elf", dest = "dump_elf", action = "store_true", default = False, help = "Dump content of each section to an ELF file")
     parser.add_argument("fw_file", type = str, help = "Firmware file (.lod)")
 
     args = parser.parse_args()
@@ -300,8 +311,8 @@ if __name__ == "__main__":
         chunk_string = "Artifact % 2d: file_offset = 0x%x, size = 0x%x, type = 0x%x (%s)" % \
             (chunk["chunk_index"], chunk["file_offset"], chunk["header"]["content_size"], chunk["header"]["type"], ARTIFACT_NAMES[chunk["header"]["type"]])
 
+        fw_filename = os.path.basename(args.fw_file)
         if args.dump_sections:
-            fw_filename = os.path.basename(args.fw_file)
             with open("%s_0x%08x_Artifact_%d.bin" % (fw_filename, chunk["file_offset"], chunk["chunk_index"]), 'wb') as file:
                 file.write(chunk["content_raw"])
 
@@ -314,6 +325,8 @@ if __name__ == "__main__":
             
         if not chunk["content_crc_ok"]:
             chunk_string += ", content checksum wrong!"
+
+        memmap = []
         
 #        print(struct_to_string(CHUNK_HEADER_DEFINITION, parse_struct(CHUNK_HEADER_DEFINITION, chunk["header_raw"])))
         print(chunk_string)
@@ -321,12 +334,16 @@ if __name__ == "__main__":
         if "segment_header" in chunk:
             print("\tSegment header: file offset = 0x%x, Flash address = 0x%x, load address = 0x%x, size = 0x%x" % \
                 (chunk["segment_header"]["file_offset"], chunk["segment_header"]["flash_address"], chunk["segment_header"]["load_address"], chunk["segment_header"]["size_in_words"] * 4))
-            if args.dump_sections:
-                segment_offset = chunk["segment_header"]["file_offset"]
-                segment_size = chunk["segment_header"]["size_in_words"]  * 4
-                if segment_offset + segment_size < len(file_data):
+            segment_offset = chunk["segment_header"]["file_offset"]
+            segment_size = chunk["segment_header"]["size_in_words"]  * 4
+            if segment_offset + segment_size < len(file_data):
+                memmap.append({"type": "data", "data": file_data[segment_offset: segment_offset + segment_size],
+                               "address": chunk["segment_header"]["load_address"], "flags": "rwx",
+                               "memory_size": len(file_data[segment_offset: segment_offset + segment_size])})
+                if args.dump_sections:
                     with open("%s_0x%08x_Segment_%d.bin" % (fw_filename, chunk["segment_header"]["file_offset"] , chunk["chunk_index"]), 'wb') as file:
                         file.write(file_data[segment_offset: segment_offset + segment_size])
+
                         
         if "sections_header" in chunk:
             print("\tSections header: File offset = 0x%x, magic = 0x%x, field_14 = 0x%x, checksum = 0x%x, field_18 = 0x%x, field_1C = 0x%x" % \
@@ -340,14 +357,27 @@ if __name__ == "__main__":
                         section_size = section["size"]
                         print("\t\t\tSection %d: file offset = 0x%x, load address = 0x%x, size = 0x%x, load = %s" % \
                             (j, section_offset, section["header"]["load_address"], section_size, section["load"]))
+                        memmap.append({"type": "data", "data": file_data[section_offset: section_offset + section_size],
+                                       "address": section["header"]["load_address"], "flags": "rwx",
+                                       "memory_size": len(file_data[section_offset: section_offset + section_size])})
                         if args.dump_sections and section_size > 0:
                             with open("%s_0x%08x_Section_%d_%d.bin" % (fw_filename, section["file_offset"] , i, j), 'wb') as file:
                                 file.write(file_data[section_offset: section_offset + section_size])
         if chunk["header"]["type"] == ARTIFACT_OVERLAY:
+            data = file_data[chunk["content"]["file_offset"]:  chunk["content"]["file_offset"] + chunk["content"]["header"]["size"]]
             print("\tOverlay: number = %d, id = 0x%x, size = 0x%x, load_address = 0x%x" % \
                 (chunk["content"]["header"]["number"], chunk["content"]["header"]["id"], \
                  chunk["content"]["header"]["size"], chunk["content"]["header"]["load_address"])) 
+            memmap.append({"type": "data", "data": data,
+                           "address": section["header"]["load_address"], "flags": "rwx",
+                           "memory_size": len(data)})
             if args.dump_sections:
                 with open("%s_0x%08x_Overlay_%d.bin" % (fw_filename, chunk["content"]["file_offset"], chunk["content"]["header"]["number"]), 'wb') as file:
-                    file.write(file_data[chunk["content"]["file_offset"]:  chunk["content"]["file_offset"] + chunk["content"]["header"]["size"]])
+                    file.write(data)
+        if args.dump_elf:
+            if memmap:
+                elf = pywriteelf.elffile_from_memory_map(memmap)
+                with open("%s_0x%08x_Artifact_%d.elf" %(fw_filename, chunk["file_offset"], chunk["chunk_index"]), "wb") as f:
+                    f.write(elf.get_data())
+
     
